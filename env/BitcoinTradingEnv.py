@@ -1,122 +1,115 @@
 import gym
+import logging
 import pandas as pd
 import numpy as np
+from numpy import inf
 from gym import spaces
 from sklearn import preprocessing
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 from render.BitcoinTradingGraph import BitcoinTradingGraph
-
-MAX_TRADING_SESSION = 100000
+from util.risk_adjusted_returns import sortino_ratio, sterling_ratio, omega_ratio
+from util.stationarization import log_and_difference
+from util.indicators import add_indicators
 
 
 class BitcoinTradingEnv(gym.Env):
     """A Bitcoin trading environment for OpenAI gym"""
     metadata = {'render.modes': ['human', 'system', 'none']}
-    scaler = preprocessing.MinMaxScaler()
     viewer = None
 
-    def __init__(self, df, lookback_window_size=40, initial_balance=10000, commission=0.00075, serial=False):
+    def __init__(self, df, initial_balance=10000, commission=0.0003, reward_func='sortino', **kwargs):
         super(BitcoinTradingEnv, self).__init__()
 
-        self.df = df.dropna().reset_index()
-        self.lookback_window_size = lookback_window_size
         self.initial_balance = initial_balance
         self.commission = commission
-        self.serial = serial
+        self.reward_func = reward_func
 
-        # Actions of the format Buy 1/10, Sell 3/10, Hold (amount ignored), etc.
-        self.action_space = spaces.MultiDiscrete([3, 10])
+        self.df = df.fillna(method='bfill')
+        self.df = add_indicators(self.df.reset_index())
+        self.stationary_df = log_and_difference(
+            self.df, ['Open', 'High', 'Low', 'Close', 'Volume BTC', 'Volume USD'])
 
-        # Observes the OHCLV values, net worth, and trade history
+        self.n_forecasts = kwargs.get('n_forecasts', 10)
+        self.confidence_interval = kwargs.get('confidence_interval', 0.95)
+        self.obs_shape = (1, 5 + len(self.df.columns) -
+                          2 + (self.n_forecasts * 3))
+
+        # Actions of the format Buy 1/4, Sell 3/4, Hold (amount ignored), etc.
+        self.action_space = spaces.Discrete(12)
+
+        # Observes the price action, indicators, account action, price forecasts
         self.observation_space = spaces.Box(
-            low=0, high=1, shape=(10, lookback_window_size + 1), dtype=np.float16)
+            low=0, high=1, shape=self.obs_shape, dtype=np.float16)
 
     def _next_observation(self):
-        end = self.current_step + self.lookback_window_size + 1
+        scaler = preprocessing.MinMaxScaler()
 
-        scaled_df = self.active_df.values[:end].astype('float64')
-        scaled_df = self.scaler.fit_transform(scaled_df)
-        scaled_df = pd.DataFrame(scaled_df, columns=self.df.columns)
+        features = self.stationary_df[self.stationary_df.columns.difference([
+            'index', 'Date'])]
 
-        obs = np.array([
-            scaled_df['Open'].values[self.current_step:end],
-            scaled_df['High'].values[self.current_step:end],
-            scaled_df['Low'].values[self.current_step:end],
-            scaled_df['Close'].values[self.current_step:end],
-            scaled_df['Volume_(BTC)'].values[self.current_step:end],
-        ])
+        scaled = features[:self.current_step + self.n_forecasts + 1].values
+        scaled[abs(scaled) == inf] = 0
+        scaled = scaler.fit_transform(scaled.astype('float64'))
+        scaled = pd.DataFrame(scaled, columns=features.columns)
 
-        scaled_history = self.scaler.fit_transform(self.account_history)
+        obs = scaled.values[-1]
 
-        obs = np.append(
-            obs, scaled_history[:, -(self.lookback_window_size + 1):], axis=0)
+        past_df = self.stationary_df['Close'][:
+                                              self.current_step + self.n_forecasts + 1]
+        forecast_model = SARIMAX(past_df.values)
+        model_fit = forecast_model.fit(method='bfgs', disp=False)
+        forecast = model_fit.get_forecast(
+            steps=self.n_forecasts, alpha=(1 - self.confidence_interval))
+
+        obs = np.insert(obs, len(obs), forecast.predicted_mean, axis=0)
+        obs = np.insert(obs, len(obs), forecast.conf_int().flatten(), axis=0)
+
+        scaled_history = scaler.fit_transform(
+            self.account_history.astype('float64'))
+
+        obs = np.insert(obs, len(obs), scaled_history[:, -1], axis=0)
+
+        obs = np.reshape(obs.astype('float16'), self.obs_shape)
 
         return obs
 
-    def _reset_session(self):
-        self.current_step = 0
+    def _current_price(self):
+        return self.df['Close'].values[self.current_step + self.n_forecasts] + 0.01
 
-        if self.serial:
-            self.steps_left = len(self.df) - self.lookback_window_size - 1
-            self.frame_start = self.lookback_window_size
-        else:
-            self.steps_left = np.random.randint(1, MAX_TRADING_SESSION)
-            self.frame_start = np.random.randint(
-                self.lookback_window_size, len(self.df) - self.steps_left)
-
-        self.active_df = self.df[self.frame_start - self.lookback_window_size:
-                                 self.frame_start + self.steps_left]
-
-    def reset(self):
-        self.balance = self.initial_balance
-        self.net_worth = self.initial_balance
-        self.btc_held = 0
-
-        self._reset_session()
-
-        self.account_history = np.repeat([
-            [self.balance],
-            [0],
-            [0],
-            [0],
-            [0]
-        ], self.lookback_window_size + 1, axis=1)
-        self.trades = []
-
-        return self._next_observation()
-
-    def _get_current_price(self):
-        return self.df['Close'].values[self.frame_start + self.current_step]
-
-    def _take_action(self, action, current_price):
-        action_type = action[0]
-        amount = action[1] / 10
+    def _take_action(self, action):
+        current_price = self._current_price()
+        action_type = int(action / 4)
+        amount = 1 / (action % 4 + 1)
 
         btc_bought = 0
         btc_sold = 0
         cost = 0
         sales = 0
 
-        if action_type < 1:
-            btc_bought = self.balance / current_price * amount
-            cost = btc_bought * current_price * (1 + self.commission)
+        if action_type == 0:
+            price = current_price * (1 + self.commission)
+            btc_bought = min(self.balance * amount /
+                             price, self.balance / price)
+            cost = btc_bought * price
 
             self.btc_held += btc_bought
             self.balance -= cost
-
-        elif action_type < 2:
+        elif action_type == 1:
+            price = current_price * (1 - self.commission)
             btc_sold = self.btc_held * amount
-            sales = btc_sold * current_price * (1 - self.commission)
+            sales = btc_sold * price
 
             self.btc_held -= btc_sold
             self.balance += sales
 
         if btc_sold > 0 or btc_bought > 0:
-            self.trades.append({'step': self.frame_start + self.current_step,
+            self.trades.append({'step': self.current_step,
                                 'amount': btc_sold if btc_sold > 0 else btc_bought, 'total': sales if btc_sold > 0 else cost,
                                 'type': "sell" if btc_sold > 0 else "buy"})
 
-        self.net_worth = self.balance + self.btc_held * current_price
+        self.net_worths.append(
+            self.balance + self.btc_held * current_price)
 
         self.account_history = np.append(self.account_history, [
             [self.balance],
@@ -126,46 +119,69 @@ class BitcoinTradingEnv(gym.Env):
             [sales]
         ], axis=1)
 
+    def _reward(self):
+        returns = np.diff(self.net_worths)
+        benchmark = np.diff(self.df['Close'][self.n_forecasts:self.n_forecasts +
+                                             self.current_step + 1])
+
+        if self.reward_func == 'sortino':
+            reward = sortino_ratio(returns, benchmark)
+        elif self.reward_func == 'sterling':
+            reward = sterling_ratio(returns, benchmark)
+        elif self.reward_func == 'omega':
+            reward = omega_ratio(returns)
+
+        reward = self.net_worths[-1] - self.net_worths[-2]
+
+        return reward if abs(reward) != inf else 0
+
+    def _done(self):
+        return self.net_worths[-1] < self.initial_balance / 10 \
+            or self.current_step == len(self.df) - self.n_forecasts - 1
+
+    def reset(self):
+        self.balance = self.initial_balance
+        self.net_worths = [self.initial_balance]
+        self.btc_held = 0
+        self.current_step = 0
+
+        self.account_history = np.array([
+            [self.balance],
+            [0],
+            [0],
+            [0],
+            [0]
+        ])
+        self.trades = []
+
+        return self._next_observation()
+
     def step(self, action):
-        current_price = self._get_current_price() + 0.01
+        self._take_action(action)
 
-        prev_net_worth = self.net_worth
-
-        self._take_action(action, current_price)
-
-        self.steps_left -= 1
         self.current_step += 1
 
-        if self.steps_left == 0:
-            self.balance += self.btc_held * current_price
-            self.btc_held = 0
-
-            self._reset_session()
-
         obs = self._next_observation()
-        reward = self.net_worth - prev_net_worth
-        done = self.net_worth <= 0
+        reward = self._reward()
+        done = self._done()
 
         return obs, reward, done, {}
 
-    def render(self, mode='human', **kwargs):
+    def render(self, mode='human'):
         if mode == 'system':
-            print('Price: ' + str(self._get_current_price()))
+            print('Price: ' + str(self._current_price()))
             print(
-                'Bought: ' + str(self.account_history[2][self.current_step + self.frame_start]))
+                'Bought: ' + str(self.account_history[2][self.current_step]))
             print(
-                'Sold: ' + str(self.account_history[4][self.current_step + self.frame_start]))
-            print('Net worth: ' + str(self.net_worth))
+                'Sold: ' + str(self.account_history[4][self.current_step]))
+            print('Net worth: ' + str(self.net_worths[-1]))
 
         elif mode == 'human':
             if self.viewer is None:
-                self.viewer = BitcoinTradingGraph(
-                    self.df, kwargs.get('title', None))
+                self.viewer = BitcoinTradingGraph(self.df)
 
-            self.viewer.render(self.frame_start + self.current_step,
-                               self.net_worth,
-                               self.trades,
-                               window_size=self.lookback_window_size)
+            self.viewer.render(self.current_step,
+                               self.net_worths, self.trades)
 
     def close(self):
         if self.viewer is not None:

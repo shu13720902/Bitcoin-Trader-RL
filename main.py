@@ -1,34 +1,54 @@
 import gym
+import optuna
 import pandas as pd
 
-from stable_baselines.common.policies import MlpPolicy
-from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines import A2C
+from stable_baselines.common.policies import MlpLstmPolicy
+from stable_baselines.common.vec_env import SubprocVecEnv, DummyVecEnv
+from stable_baselines import A2C, ACKTR, PPO2
 
 from env.BitcoinTradingEnv import BitcoinTradingEnv
 
-df = pd.read_csv('./data/bitstamp.csv')
-df = df.sort_values('Timestamp')
+study = optuna.load_study(study_name='optimize_profit',
+                          storage='sqlite:///agents.db')
+params = study.best_trial.params
 
-slice_point = int(len(df) - 50000)
+print(params)
 
-train_df = df[:slice_point]
-test_df = df[slice_point:]
+df = pd.read_csv('./data/coinbase_hourly.csv')
+df = df.drop(['Symbol'], axis=1)
+df = df.sort_values(['Date'])
 
-train_env = DummyVecEnv(
-    [lambda: BitcoinTradingEnv(train_df, serial=True)])
+test_len = int(len(df) * 0.2)
+train_len = 100  # int(len(df)) - test_len
 
-model = A2C(MlpPolicy, train_env, verbose=1,
-            tensorboard_log="./tensorboard/")
-model.learn(total_timesteps=200000)
+train_df = df[:train_len]
+test_df = df[train_len:]
 
-test_env = DummyVecEnv(
-    [lambda: BitcoinTradingEnv(test_df, serial=True)])
+train_env = DummyVecEnv([lambda: BitcoinTradingEnv(
+    train_df, n_forecasts=int(params['n_forecasts']), confidence_interval=params['confidence_interval'])])
+
+model_params = {
+    'n_steps': int(params['n_steps']),
+    'gamma': params['gamma'],
+    'learning_rate': params['learning_rate'],
+    'ent_coef': params['ent_coef'],
+    'cliprange': params['cliprange'],
+    'noptepochs': int(params['noptepochs']),
+    'lam': params['lam']
+}
+
+model = PPO2(MlpLstmPolicy, train_env, verbose=1, nminibatches=1,
+             tensorboard_log="./tensorboard", **model_params)
+model.learn(total_timesteps=train_len)
+
+test_env = DummyVecEnv([lambda: BitcoinTradingEnv(
+    test_df, n_forecasts=int(params['n_forecasts']), confidence_interval=params['confidence_interval'])])
 
 obs = test_env.reset()
-for i in range(50000):
+for i in range(test_len):
     action, _states = model.predict(obs)
     obs, rewards, done, info = test_env.step(action)
-    test_env.render(mode="system", title="BTC")
+
+    test_env.render(mode="human")
 
 test_env.close()
